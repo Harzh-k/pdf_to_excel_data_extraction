@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """
-Universal IRDAI PDF → Excel Extractor
-Each table gets its own sheet in the workbook.
+extract_tables_smart_merged.py — Universal IRDAI PDF → Excel Extractor
+=======================================================================
+Hybrid engine: automatically picks the right extraction strategy per page.
+
+  Engine 1 — pdfplumber (lines)    : PDFs with vertical grid lines (HDFC, LIC)
+  Engine 2 — gap-based (h_only)    : PDFs with horizontal rules only (Aditya Birla)
+  Engine 3 — docling (no_lines)    : Scanned or whitespace-only PDFs
 
 Usage:
-  python extract_tables_smart_merged.py <pdf_path> [output_path]
+    python extract_tables_smart_merged.py <pdf_path> [output_path]
+    python extract_tables_smart_merged.py <pdf_path> [output_path] --force-docling
 """
 
 import re
 import sys
 import os
+import logging
 from pathlib import Path
 
 try:
@@ -18,338 +25,426 @@ try:
     from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
     from openpyxl.utils import get_column_letter
 except ImportError as e:
-    print(f"Error: {e}\nInstall: pip install pdfplumber openpyxl")
+    print(f"Missing dependency: {e}\nInstall: pip install pdfplumber openpyxl")
     sys.exit(1)
 
+from src.extractor          import TABLE_SETTINGS, process_table
+from src.extractor_gap      import extract_gap_based
+from src.pdf_type_detector  import classify_page
 
-# ============================================================
-# STYLE CONSTANTS
-# ============================================================
-
-_thin  = Side(style="thin")
-_thick = Side(style="medium")
-
-BORDER_NONE         = Border()
-BORDER_BOTTOM_THIN  = Border(bottom=_thin)
-BORDER_BOTTOM_THICK = Border(bottom=_thick)
-BORDER_H_THIN       = Border(top=_thin, bottom=_thin)
-
-FILL_PAGE_HDR = PatternFill("solid", fgColor="1F3864")  # dark navy
-FILL_FORM_HDR = PatternFill("solid", fgColor="C00000")  # IRDAI red
-FILL_COL_HDR  = PatternFill("solid", fgColor="2E75B6")  # blue
-FILL_SUB_HDR  = PatternFill("solid", fgColor="D6E4F0")  # light blue
-FILL_TOTAL    = PatternFill("solid", fgColor="E2EFDA")  # light green
-FILL_NONE     = PatternFill("none")
-
-FONT_PAGE_HDR = Font(bold=True, color="FFFFFF", size=10)
-FONT_WHITE    = Font(bold=True, color="FFFFFF", size=9)
-FONT_BOLD     = Font(bold=True, size=9)
-FONT_NORMAL   = Font(size=9)
-
-ALIGN_TOP_WRAP = Alignment(vertical="top", wrap_text=True)
-ALIGN_CENTER   = Alignment(vertical="center", indent=1)
-
-_COL_HDR_KEYS = {
-    "LIFE", "PENSION", "HEALTH", "ANNUITY", "PARTICULARS",
-    "LINKED BUSINESS", "PARTICIPATING", "NON-PARTICIPATING",
-    "VAR.INS", "VAR. INS"
-}
-_TOTAL_KEYS = {
-    "TOTAL (A)", "TOTAL (B)", "TOTAL (C)", "TOTAL (D)",
-    "SUB TOTAL", "TOTAL", "SURPLUS", "DEFICIT",
-    "AMOUNT AVAILABLE", "APPROPRIATION"
-}
-_FORM_HDR_KEYS = {
-    "FORM L-", "REVENUE ACCOUNT", "PROFIT AND LOSS",
-    "BALANCE SHEET", "POLICYHOLDERS", "NAME OF THE INSURER",
-    "REGISTRATION", "SCHEDULE"
-}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# ROW CLASSIFIER
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# STYLES  (unchanged from previous version)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _classify_row(row, row_idx):
-    text = " ".join(str(c) for c in row if c).upper().strip()
-    if row_idx < 7 and any(k in text for k in _FORM_HDR_KEYS):
-        return "form_header"
-    if any(k in text for k in _COL_HDR_KEYS):
-        return "col_header"
-    if any(k in text for k in _TOTAL_KEYS):
-        return "total"
+_DB    = "1F4E79"
+_S_T   = Side(style="thin",   color="BFBFBF")
+_S_M   = Side(style="medium", color=_DB)
+B_NONE = Border()
+B_HDR  = Border(top=_S_M,  bottom=_S_M)
+B_TOT  = Border(top=_S_T,  bottom=_S_T)
+B_SHR  = Border(bottom=_S_M)
+F_DB   = PatternFill("solid", fgColor=_DB)
+F_NO   = PatternFill("none")
+FT_SH  = Font(name="Calibri", bold=True,  size=10, color="FFFFFF")
+FT_CH  = Font(name="Calibri", bold=True,  size=9,  color="FFFFFF")
+FT_B   = Font(name="Calibri", bold=True,  size=9)
+FT_N   = Font(name="Calibri", bold=False, size=9)
+FT_M   = Font(name="Calibri", bold=False, size=8,  color="595959")
+A_WR   = Alignment(vertical="top",    wrap_text=True)
+A_CT   = Alignment(vertical="center", horizontal="center", wrap_text=True)
+A_ML   = Alignment(vertical="center", indent=1)
+A_NR   = Alignment(vertical="top",    horizontal="right")
+
+_COL_KW  = {"LIFE","PENSION","HEALTH","ANNUITY","LINKED BUSINESS",
+            "PARTICIPATING","NON-PARTICIPATING","VAR.INS","VAR. INS","PARTICULARS",
+            "FORM NO","SR NO","FORM NO.","SR NO.","PAGE NO","PAGE NO."}
+_TOT_KW  = {"TOTAL (A)","TOTAL (B)","TOTAL (C)","TOTAL (D)",
+            "SUB TOTAL","SUB-TOTAL","SURPLUS","DEFICIT","AMOUNT AVAILABLE","TOTAL"}
+_FORM_KW = {"FORM L-","REVENUE ACCOUNT","PROFIT AND LOSS",
+            "BALANCE SHEET","POLICYHOLDERS","NAME OF THE INSURER"}
+
+# Matches L-XX form codes like L-26, L-1-A-RA, L-14A etc.
+_FORM_CODE_RE = re.compile(r"^L-[\dA-Za-z]")
+
+
+def _is_index_data_row(row):
+    """
+    True when row is an index/TOC entry: [number, L-XX code, description...].
+    These must NEVER be styled blue even if description contains "Life"/"Linked".
+    Pattern: first cell is a digit, second cell starts with L-
+    """
+    cells = [str(c).strip() for c in row if c and str(c).strip()]
+    if len(cells) < 2:
+        return False
+    return cells[0].replace(".", "").isdigit() and _FORM_CODE_RE.match(cells[1])
+
+
+def classify_row(row, idx, is_idx=False):
+    """
+    Classify a table row for Excel styling.
+    Returns: col_header | total | form_meta | section | normal
+
+    col_header  → dark blue fill, white bold font  (column header rows)
+    total       → bold, thin border top+bottom     (subtotal / total rows)
+    form_meta   → small grey font                  (form title / insurer info)
+    section     → bold                             (section heading rows)
+    normal      → regular                          (data rows)
+    """
+    # Index/TOC pages: only the very first row is a header
+    if is_idx:
+        return "col_header" if idx == 0 else "normal"
+
+    # Index data rows (number | L-XX | description): never miscolor as header
+    if _is_index_data_row(row):
+        return "normal"
+
+    t = " ".join(str(c) for c in row if c).upper().strip()
+
+    # col_header guard: row must contain IRDAI column keywords
+    # AND must have few actual data numbers (headers have col names, not values)
+    if any(k in t for k in _COL_KW):
+        num_vals = sum(
+            1 for c in row
+            if c and re.match(r"^-?\d[\d,\.]+$", str(c).strip())
+        )
+        if num_vals <= 2:          # allow "-" dashes but not actual figures
+            return "col_header"
+
+    # Total rows
+    for k in _TOT_KW:
+        if re.search(r"\b" + re.escape(k) + r"\b", t):
+            return "total"
+
+    # Form/insurer metadata (first few rows of every sheet)
+    if idx < 6 and any(k in t for k in _FORM_KW):
+        return "form_meta"
+
+    # All-caps multi-word section headings
+    ws = [w for w in t.split() if len(w) > 2]
+    if ws and all(w.isupper() for w in ws) and len(ws) >= 2:
+        return "section"
+
     return "normal"
 
 
-# ============================================================
-# SHEET NAME BUILDER
-# ============================================================
-
-def _make_sheet_name(used_names, form_name, page_number, table_index):
-    """
-    Build a unique, Excel-safe sheet name.
-    Excel limit: 31 chars, no special chars [ ] : * ? / \
-    """
-    # Extract short form code e.g. 'L-1-A-RA' from 'FORM L-1-A-RA'
-    if form_name:
-        short = re.sub(r"^FORM\s+", "", form_name).strip()
-    else:
-        short = "Sheet"
-
-    # Remove Excel-illegal chars
-    short = re.sub(r"[\[\]:*?/\\]", "-", short)
-
-    # Build candidate name
-    candidate = f"{short}_P{page_number}"
-    if table_index > 1:
-        candidate += f"_T{table_index}"
-
-    # Truncate to 31 chars
-    candidate = candidate[:31]
-
-    # Ensure uniqueness by appending suffix if needed
-    base = candidate
-    suffix = 2
-    while candidate in used_names:
-        candidate = f"{base[:28]}_{suffix}"
-        suffix += 1
-
-    used_names.add(candidate)
-    return candidate
+def is_num(v):
+    if not v: return False
+    try: float(str(v).replace(",","").replace("(","").replace(")","").replace("-","").strip()); return True
+    except: return False
 
 
-# ============================================================
-# SHEET WRITER
-# ============================================================
+def apply_style(ws, er, row, rt, nc):
+    for ci, val in enumerate(row, 1):
+        c = ws.cell(row=er, column=ci, value=val if val else None)
+        n = ci > 1 and is_num(val)
+        if   rt == "col_header": c.font=FT_CH; c.fill=F_DB; c.border=B_HDR; c.alignment=A_CT
+        elif rt == "total":      c.font=FT_B;  c.fill=F_NO; c.border=B_TOT; c.alignment=A_NR if n else A_WR
+        elif rt == "form_meta":  c.font=FT_M;  c.fill=F_NO; c.border=B_NONE; c.alignment=A_WR
+        elif rt == "section":    c.font=FT_B;  c.fill=F_NO; c.border=B_NONE; c.alignment=A_WR
+        else:                    c.font=FT_N;  c.fill=F_NO; c.border=B_NONE; c.alignment=A_NR if n else A_WR
 
-def _write_table_to_sheet(ws, table_data, page_number, form_name):
-    """Write a single table to a worksheet with formatting."""
 
-    cur_row = 1
-
-    # Sheet header banner
-    hdr_text = f"Page {page_number}"
-    if form_name:
-        hdr_text += f"   |   {form_name}"
-
-    cell = ws.cell(row=cur_row, column=1, value=hdr_text)
-    cell.font      = FONT_PAGE_HDR
-    cell.fill      = FILL_PAGE_HDR
-    cell.border    = Border(bottom=_thick)
-    cell.alignment = ALIGN_CENTER
-    cur_row += 1
-
-    # Table rows
-    for row_idx, row in enumerate(table_data):
-        row_type = _classify_row(row, row_idx)
-
-        for ci, val in enumerate(row, start=1):
-            cell = ws.cell(row=cur_row, column=ci, value=val if val else None)
-            cell.alignment = ALIGN_TOP_WRAP
-
-            if row_type == "form_header":
-                if row_idx == 0:
-                    cell.fill   = FILL_FORM_HDR
-                    cell.font   = FONT_WHITE
-                    cell.border = BORDER_BOTTOM_THIN
-                else:
-                    cell.fill   = FILL_SUB_HDR
-                    cell.font   = FONT_BOLD
-                    cell.border = BORDER_BOTTOM_THIN
-
-            elif row_type == "col_header":
-                cell.fill   = FILL_COL_HDR
-                cell.font   = FONT_WHITE
-                cell.border = BORDER_BOTTOM_THICK
-
-            elif row_type == "total":
-                cell.fill   = FILL_TOTAL
-                cell.font   = FONT_BOLD
-                cell.border = BORDER_H_THIN
-
-            else:
-                cell.font   = FONT_NORMAL
-                cell.fill   = FILL_NONE
-                cell.border = BORDER_NONE
-
-        cur_row += 1
-
-    # Auto column widths
-    col_widths = {}
+def set_col_widths(ws):
+    w = {}
     for row in ws.iter_rows():
-        for cell in row:
-            if cell.value:
-                first_line = str(cell.value).split("\n")[0]
-                col_widths[cell.column] = max(
-                    col_widths.get(cell.column, 0), len(first_line)
-                )
-    for col, width in col_widths.items():
+        for c in row:
+            if c.value:
+                w[c.column] = max(w.get(c.column, 8), len(str(c.value).split("\n")[0]))
+    for col, width in w.items():
         ws.column_dimensions[get_column_letter(col)].width = min(width + 2, 40)
 
-    # Freeze top 2 rows (banner + first data row)
-    ws.freeze_panes = "A3"
+
+def make_sheet_name(pb, used):
+    b = f"P{pb['page_number']}"
+    if pb.get("form_name"):
+        b = f"P{pb['page_number']}_{pb['form_name'].replace('FORM ','').strip()}"
+    b = re.sub(r"[\\/*?:\[\]]", "", b)[:31]
+    if b not in used: used.add(b); return b
+    for n in range(2, 100):
+        c = f"{b[:28]}_{n}"
+        if c not in used: used.add(c); return c
+    return b
 
 
-# ============================================================
-# EXTRACTION ENGINE
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# HYBRID EXTRACTION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
 
-def extract_forms_from_pdf(pdf_path):
-    from src.extractor import TABLE_SETTINGS, header_needs_rebuild, rebuild_using_header_spans
+def _extract_page_pdfplumber(page, current_form):
+    """
+    Engine 1: pdfplumber line-based extraction.
+    Falls back to gap-based when pdfplumber finds significantly fewer rows
+    than gap detection (handles pages where main table has no vertical lines
+    but pdfplumber catches only a smaller sub-table that has them).
+    """
+    text   = page.extract_text() or ""
+    tables = page.find_tables(table_settings=TABLE_SETTINGS)
+    # Information score = rows × cols (total data cells)
+    # This correctly prefers 70r×22c (1540) over 69r×2c (138)
+    pp_rows = sum(len(t.extract()) for t in tables) if tables else 0
+    pp_cols = max((len(t.extract()[0]) for t in tables if t.extract()), default=1) if tables else 1
+    pp_score = pp_rows * pp_cols
 
-    document_pages = []
-    current_form_name = None
+    # Try gap-based extraction
+    gap_data = extract_gap_based(page)
+    gap_rows = len(gap_data) if gap_data else 0
+    gap_cols = len(gap_data[0]) if gap_data else 0
+    gap_score = gap_rows * gap_cols
+
+    # Use gap only if it scores meaningfully better AND has more columns than pdfplumber
+    # (gap winning with fewer cols means it collapsed everything into 2 cols = bad)
+    use_gap = (
+        gap_data
+        and gap_score > pp_score * 1.5   # gap must be 50% more total cells
+        and gap_cols >= pp_cols           # gap must not have fewer columns
+    )
+
+    if use_gap:
+        logger.info(
+            f"  Page {page.page_number} [gap>pdfplumber score {gap_score}>{pp_score}]: "
+            f"{gap_rows}r × {gap_cols}c"
+        )
+        return [{"type": "table", "data": gap_data}]
+
+    content = []
+    if tables:
+        for t in tables:
+            raw    = t.extract()
+            is_idx = (len(raw) == 2 and raw[1] and
+                      any("\n" in str(c) for c in raw[1] if c))
+            fin = process_table(page, t)
+            content.append({"type": "table", "data": fin})
+            logger.info(
+                f"  Page {page.page_number} [pdfplumber]: "
+                f"{len(fin)}r × {len(fin[0]) if fin else 0}c"
+            )
+    else:
+        lines = [l for l in text.split("\n") if l.strip()]
+        if lines:
+            content.append({"type": "text", "data": lines})
+
+    return content
+
+
+def _extract_page_gap(page, current_form):
+    """Engine 2: gap-based for h_only PDFs."""
+    content = []
+    rows    = extract_gap_based(page)
+
+    if rows:
+        content.append({"type": "table", "data": rows})
+        logger.info(
+            f"  Page {page.page_number} [gap-based]: "
+            f"{len(rows)}r × {len(rows[0]) if rows else 0}c"
+        )
+    else:
+        # Fallback to plain text
+        text  = page.extract_text() or ""
+        lines = [l for l in text.split("\n") if l.strip()]
+        if lines:
+            content.append({"type": "text", "data": lines})
+        logger.warning(f"  Page {page.page_number} [gap-based]: failed, using text")
+
+    return content
+
+
+def extract_document(pdf_path: str, force_docling: bool = False) -> list:
+    """
+    Main extraction entry point.
+    Automatically routes each page to the right engine.
+
+    Args:
+        pdf_path:      path to PDF file
+        force_docling: skip detection, use docling for ALL pages
+
+    Returns: list of page_block dicts
+    """
+    document    = []
+    current_form = None
+
+    # ── Check if docling is needed ────────────────────────────────────────────
+    docling_pages = []
 
     with pdfplumber.open(pdf_path) as pdf:
+        total = len(pdf.pages)
+        logger.info(f"Opened '{Path(pdf_path).name}' — {total} pages")
+
         for page in pdf.pages:
-            text = page.extract_text() or ""
+            pg_num  = page.page_number
+            text    = page.extract_text() or ""
 
+            # Track form name
             m = re.search(r"FORM\s+L-[\dA-Za-z\-]+", text)
-            if m:
-                current_form_name = m.group().strip()
+            if m: current_form = m.group().strip()
 
-            page_block = {
-                "page_number": page.page_number,
-                "form_name": current_form_name,
-                "content": []
+            pb = {
+                "page_number": pg_num,
+                "form_name":   current_form,
+                "is_index":    False,
+                "content":     [],
+                "engine":      None,
             }
 
-            found_tables = page.find_tables(table_settings=TABLE_SETTINGS)
+            if force_docling:
+                docling_pages.append(pg_num)
+                document.append(pb)
+                continue
 
-            if found_tables:
-                for idx, table in enumerate(found_tables):
-                    table_data = table.extract()
+            # ── Detect page type and route ────────────────────────────────────
+            pg_type = classify_page(page)
+            pb["engine"] = pg_type
 
-                    if header_needs_rebuild(table_data):
-                        rebuilt = rebuild_using_header_spans(page, table.bbox)
-                        if rebuilt:
-                            table_data = rebuilt
+            if pg_type == "lines":
+                pb["content"] = _extract_page_pdfplumber(page, current_form)
 
-                    page_block["content"].append({
-                        "type": "table",
-                        "index_on_page": idx + 1,
-                        "data": table_data
-                    })
+            elif pg_type == "h_only":
+                pb["content"] = _extract_page_gap(page, current_form)
 
-            if not page_block["content"]:
-                page_block["content"].append({
-                    "type": "text",
-                    "data": text.split("\n")
-                })
+            else:  # 'no_lines' or 'scanned'
+                docling_pages.append(pg_num)
+                logger.info(f"  Page {pg_num} [{pg_type}]: queued for docling")
 
-            document_pages.append(page_block)
+            # Detect index page
+            for item in pb["content"]:
+                if item["type"] == "table":
+                    raw = item["data"]
+                    if (len(raw) == 2 and raw[1] and
+                            any("\n" in str(c) for c in raw[1] if c)):
+                        pb["is_index"] = True
 
-    print(f"Processed {len(document_pages)} pages.")
-    return document_pages
+            document.append(pb)
+
+    # ── Docling pass for no_lines / scanned pages ─────────────────────────────
+    if docling_pages:
+        logger.info(
+            f"\n{len(docling_pages)} pages need docling "
+            f"(no_lines/scanned): {docling_pages[:10]}{'...' if len(docling_pages)>10 else ''}"
+        )
+        try:
+            from src.extractor_docling import extract_with_docling
+            docling_blocks = extract_with_docling(pdf_path, page_numbers=docling_pages)
+
+            # Merge docling results back into document
+            docling_map = {b["page_number"]: b for b in docling_blocks}
+            for pb in document:
+                if pb["page_number"] in docling_map:
+                    db = docling_map[pb["page_number"]]
+                    pb["content"] = db["content"]
+                    pb["engine"]  = "docling"
+
+        except ImportError:
+            logger.warning(
+                "docling not installed — pages with no lines will be extracted "
+                "as plain text.\n"
+                "Install with: pip install docling"
+            )
+            # Fallback: try gap-based on those pages too
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    if page.page_number not in docling_pages:
+                        continue
+                    for pb in document:
+                        if pb["page_number"] == page.page_number:
+                            pb["content"] = _extract_page_gap(page, pb.get("form_name"))
+                            pb["engine"]  = "gap-fallback"
+
+    return document
 
 
-# ============================================================
-# EXCEL CREATION — ONE SHEET PER TABLE
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL WRITER  (unchanged)
+# ══════════════════════════════════════════════════════════════════════════════
 
-def create_excel_from_forms(document_pages, output_path):
-    print("Creating Excel workbook (one sheet per table)...")
-
-    wb = Workbook()
+def write_excel(document: list, output_path: str):
+    wb, used = Workbook(), set()
     wb.remove(wb.active)
 
-    used_sheet_names = set()
-    total_sheets = 0
+    for pb in document:
+        sn = make_sheet_name(pb, used)
+        ws = wb.create_sheet(title=sn)
+        cr = 1
 
-    for pb in document_pages:
-        page_number = pb["page_number"]
-        form_name   = pb["form_name"]
-        contents    = pb["content"]
+        title = f"Page {pb['page_number']}"
+        if pb.get("form_name"): title += f"   |   {pb['form_name']}"
+        hc = ws.cell(row=1, column=1, value=title)
+        hc.font=FT_SH; hc.fill=F_DB; hc.border=B_SHR; hc.alignment=A_ML
+        cr = 2
 
-        # Count tables on this page for naming
-        table_count = 0
-
-        for item in contents:
-
+        for item in pb["content"]:
             if item["type"] == "table":
-                table_count += 1
-                sheet_name = _make_sheet_name(
-                    used_sheet_names, form_name, page_number, table_count
-                )
-                ws = wb.create_sheet(title=sheet_name)
-                _write_table_to_sheet(ws, item["data"], page_number, form_name)
-                total_sheets += 1
-                print(f"  Sheet '{sheet_name}': {len(item['data'])} rows")
+                td = item["data"]
+                if not td: continue
+                nc = max(len(r) for r in td)
+                for ri, row in enumerate(td):
+                    row = list(row) + [""] * (nc - len(row))
+                    rt  = classify_row(row, ri, pb.get("is_index", False))
+                    apply_style(ws, cr, row, rt, nc)
+                    cr += 1
+                cr += 1
+            else:
+                for line in item["data"]:
+                    c = ws.cell(row=cr, column=1, value=line)
+                    c.font=FT_N; c.alignment=A_WR
+                    cr += 1
+                cr += 1
 
-            elif item["type"] == "text":
-                # Text-only pages (no tables found) → one sheet with raw text
-                lines = [l for l in item["data"] if l.strip()]
-                if not lines:
-                    continue
-                sheet_name = _make_sheet_name(
-                    used_sheet_names, form_name, page_number, 1
-                )
-                ws = wb.create_sheet(title=sheet_name)
+        set_col_widths(ws)
+        ws.freeze_panes = "A2"
 
-                # Simple banner
-                cell = ws.cell(row=1, column=1, value=f"Page {page_number} — text only")
-                cell.font   = FONT_PAGE_HDR
-                cell.fill   = FILL_PAGE_HDR
-                cell.border = Border(bottom=_thick)
-
-                for i, line in enumerate(lines, start=2):
-                    ws.cell(row=i, column=1, value=line).font = FONT_NORMAL
-
-                ws.column_dimensions["A"].width = 80
-                ws.freeze_panes = "A2"
-                total_sheets += 1
-
-    # Save
     try:
         wb.save(output_path)
-        size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        print(f"\n✓ Excel saved: {output_path}")
-        print(f"  Size: {size_mb:.2f} MB  |  Sheets: {total_sheets}  |  Pages: {len(document_pages)}")
-        return output_path
+        size_kb = os.path.getsize(output_path) // 1024
+        logger.info(f"Saved '{output_path}' ({size_kb} KB, {len(document)} sheets)")
     except PermissionError:
-        print(f"Error: Close the file first: {output_path}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error saving: {e}")
+        logger.error(f"File is open — close it first: {output_path}")
         sys.exit(1)
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
-# ============================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python extract_tables_smart_merged.py <pdf_path> [output_path]")
+        print(__doc__)
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
+    pdf_path      = sys.argv[1]
+    force_docling = "--force-docling" in sys.argv
+
     if not os.path.exists(pdf_path):
-        print(f"File not found: {pdf_path}")
+        logger.error(f"File not found: {pdf_path}")
         sys.exit(1)
 
-    if len(sys.argv) >= 3:
-        output_path = sys.argv[2]
-    else:
-        output_path = Path(pdf_path).stem + "_IRDA_Forms.xlsx"
-
+    output_path = (
+        sys.argv[2] if len(sys.argv) >= 3 and not sys.argv[2].startswith("--")
+        else str(Path(pdf_path).with_suffix("")) + "_IRDAI.xlsx"
+    )
     if not output_path.lower().endswith(".xlsx"):
         output_path += ".xlsx"
 
-    print("=" * 60)
-    print("Universal IRDAI PDF → Excel Extractor")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("IRDAI Hybrid PDF → Excel Extractor")
+    logger.info("=" * 60)
 
-    forms = extract_forms_from_pdf(pdf_path)
-    if not forms:
-        print("No content extracted.")
+    document = extract_document(pdf_path, force_docling=force_docling)
+    if not document:
+        logger.warning("No content extracted.")
         sys.exit(0)
 
-    create_excel_from_forms(forms, output_path)
+    write_excel(document, output_path)
 
-    print("=" * 60)
-    print("Done!")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Done.")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

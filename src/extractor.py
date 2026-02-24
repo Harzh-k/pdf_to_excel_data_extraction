@@ -12,6 +12,8 @@ Key insight from diagnostic data (pdf2.pdf page 3):
 """
 
 import re
+import logging
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # TABLE DETECTION SETTINGS
@@ -195,3 +197,68 @@ def rebuild_using_header_spans(page, bbox):
         if any(c.strip() for c in row):
             result.append(_fix_number_splits(row))
     return result
+
+
+def process_table(page, table):
+    """
+    High-level entry point called per table.
+    Returns finalised list-of-rows ready for Excel output.
+    """
+    raw = table.extract()
+
+    # Index page: expand multi-line cells into individual rows
+    if _is_index_table(raw):
+        return _expand_index_table(raw)
+
+    # All other tables: try word-coordinate rebuild
+    if should_rebuild(raw):
+        rebuilt = rebuild_table(page, table.bbox)
+        if rebuilt:
+            return rebuilt
+        logger.warning(f"rebuild_table failed for bbox={table.bbox}, using raw extraction")
+
+    return raw
+
+
+def _is_index_table(table_data):
+    if len(table_data) != 2:
+        return False
+    row = table_data[1]
+    return any("\n" in str(c) for c in row if c)
+
+
+def _expand_index_table(table_data):
+    header   = table_data[0]
+    data_row = table_data[1]
+    cols     = [str(c).split("\n") if c else [] for c in data_row]
+    max_rows = max((len(c) for c in cols), default=0)
+    cols     = [c + [""] * (max_rows - len(c)) for c in cols]
+    result   = [header]
+    for i in range(max_rows):
+        result.append([c[i] if i < len(c) else "" for c in cols])
+    return result
+
+
+def should_rebuild(table_data):
+    if not table_data:
+        return False
+    if _is_index_table(table_data):
+        return True
+    IRDAI_COL_KW = ["LIFE", "PENSION", "HEALTH", "ANNUITY", "VAR.INS", "VAR. INS"]
+    for row in table_data[:8]:
+        for cell in row:
+            if not cell: continue
+            text = str(cell)
+            if "\n" in text: continue
+            if sum(1 for k in IRDAI_COL_KW if k in text.upper()) >= 2:
+                return True
+    import re
+    for row in table_data[:5]:
+        for cell in row:
+            if cell and re.search(r"\d\s+[,\d]", str(cell)):
+                return True
+    return False
+
+
+def rebuild_table(page, bbox):
+    return rebuild_using_header_spans(page, bbox)
