@@ -1,0 +1,35 @@
+#!/bin/bash
+
+CMD=$1
+shift
+
+if [ "$CMD" = "help" ]; then
+  echo "GSD (Get Shit Done) - Agentic Workflow Tools"
+  echo ""
+  echo "This toolset is designed to be used by an AI Agent (like me)."
+  echo "The commands output JSON instructions that I use to plan and execute work."
+  echo ""
+  echo "Usage:"
+  echo "  ./gsd map-codebase    -> Usage: /gsd:map-codebase"
+  echo "  ./gsd new-project     -> Usage: /gsd:new-project"
+  echo "  ./gsd plan-phase N    -> Usage: /gsd:plan-phase N"
+  echo ""
+  echo "To run these workflows:"
+  echo "1. Ask ME (the agent) to run them: \"Run the new project workflow\""
+  echo "2. Or use the interactive CLI: npx get-shit-done-cc@latest"
+  echo ""
+  echo "Direct JSON Output (for debugging):"
+  echo "  ./gsd init <workflow> [args]"
+  exit 0
+fi
+
+# Map common commands to init
+if [[ "$CMD" == "new-project" || "$CMD" == "map-codebase" ]]; then
+   echo "Running 'init $CMD'..."
+   node .gemini/get-shit-done/bin/gsd-tools.js init "$CMD" "$@"
+   exit $?
+fi
+
+# Pass through other commands
+node .gemini/get-shit-done/bin/gsd-tools.js "$CMD" "$@"
+
