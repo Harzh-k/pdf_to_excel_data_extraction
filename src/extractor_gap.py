@@ -39,7 +39,7 @@ _HDR_COL_WORDS = {
     'ANNUITY', 'TOTAL', 'VAR.INS', 'VAR.', 'INS', 'INS.',
     'VARIABLE',
 }
-_SCHED_COL_RE  = re.compile(r'^L-\d')
+_SCHED_COL_RE  = re.compile(r'^L-\d+$')   # exact: matches L-4 but NOT L-1-A-RA
 _MIN_HDR_SCORE = 4    # minimum matching header-words to activate header_cols
 _MIN_HDR_COLS  = 6    # minimum data-columns for this engine to make sense
 
@@ -233,15 +233,21 @@ def detect_col_centers(words, page_width):
     """
     Locate the row with the most LIFE/PENSION/HEALTH/ANNUITY/TOTAL keyword hits.
     Builds a sorted list of column-center x-coordinates.
-    Searches ALL rows for "GRAND … TOTAL" to capture the Grand Total column
-    (it often lives in a different row from the LIFE/PENSION sub-headers).
+
+    Three improvements over the original:
+    1. sched_x uses ^L-[0-9]+$ (exact) so L-1-A-RA form title is NOT picked up
+    2. 'Total' header (which lives in the row ABOVE the Life/Pension/... row)
+       is captured by scanning ±2 rows around the best header row
+    3. Adjacent header words that form one column (e.g. "Variable Insurance")
+       are merged into a single center spanning both words, giving a more
+       accurate column center that matches right-aligned data values
 
     Returns (col_centers, sched_x, part_boundary)
       or    (None, None, None) if not enough column headers found.
     """
     rows = _group_rows(words)
 
-    # ── Find best header row ──────────────────────────────────────────────────
+    # ── Find best header row (most LIFE/PENSION/HEALTH/... hits) ─────────────
     best_row_idx, best_score = None, 0
     for ri, row in enumerate(rows):
         score = sum(
@@ -255,15 +261,46 @@ def detect_col_centers(words, page_width):
         return None, None, None
 
     # ── Collect column centers from best header row ───────────────────────────
+    # Merge adjacent header words that belong to one column (e.g. "Variable Insurance")
+    # by extending the span of a matching word to include immediately adjacent words.
     col_centers = []
     seen = set()
-    for w in rows[best_row_idx]:
+    hdr_row = rows[best_row_idx]
+    used_indices = set()
+
+    for wi, w in enumerate(hdr_row):
+        if wi in used_indices:
+            continue
         norm = w['text'].upper().rstrip('#')
-        if norm in _HDR_COL_WORDS:
-            c = round((w['x0'] + w['x1']) / 2, 0)
-            if not any(abs(c - s) < 10 for s in seen):
-                col_centers.append((w['x0'] + w['x1']) / 2)
-                seen.add(c)
+        if norm not in _HDR_COL_WORDS:
+            continue
+
+        # Extend span to consume immediately adjacent words (gap < 5px)
+        x0_span = w['x0']
+        x1_span = w['x1']
+        for wj in range(wi + 1, len(hdr_row)):
+            nxt = hdr_row[wj]
+            if nxt['x0'] - x1_span < 5:   # adjacent
+                x1_span = nxt['x1']
+                used_indices.add(wj)
+            else:
+                break
+
+        c = round((x0_span + x1_span) / 2, 0)
+        if not any(abs(c - s) < 10 for s in seen):
+            col_centers.append((x0_span + x1_span) / 2)
+            seen.add(c)
+
+    # ── Also scan adjacent rows (±2) for 'Total' which often lives one row above ──
+    for ri in range(max(0, best_row_idx - 2), min(len(rows), best_row_idx + 3)):
+        if ri == best_row_idx:
+            continue
+        for w in rows[ri]:
+            if w['text'].upper().rstrip('#') == 'TOTAL':
+                c = round((w['x0'] + w['x1']) / 2, 0)
+                if not any(abs(c - s) < 10 for s in seen):
+                    col_centers.append((w['x0'] + w['x1']) / 2)
+                    seen.add(c)
 
     # ── Scan ALL rows for "GRAND … TOTAL" ────────────────────────────────────
     for ri in range(len(rows)):
@@ -280,9 +317,13 @@ def detect_col_centers(words, page_width):
     if len(col_centers) < _MIN_HDR_COLS:
         return None, None, None
 
-    # ── Find Schedule column x (L-4, L-5, L-6 …) ────────────────────────────
-    sched_xs = [w['x0'] for w in words if _SCHED_COL_RE.match(w['text'])]
-    sched_x  = min(sched_xs) if sched_xs else None
+    # ── Find Schedule column x (L-4, L-5, L-6 …) — exact match only ─────────
+    # Use only words from rows BELOW row 6 to skip form-title lines like L-1-A-RA
+    sched_xs = [
+        w['x0'] for w in words
+        if _SCHED_COL_RE.match(w['text']) and w['top'] > 60
+    ]
+    sched_x = min(sched_xs) if sched_xs else None
 
     # ── Particulars boundary = first col_center minus half-gap ───────────────
     gap           = (col_centers[1] - col_centers[0]) / 2 if len(col_centers) > 1 else 20
@@ -313,14 +354,29 @@ def extract_header_cols(page):
     has_sched  = sched_x is not None
     total_cols = len(col_centers) + (2 if has_sched else 1)
 
+    # Build midpoint boundaries between consecutive column centers for zone assignment.
+    # Zone-based assignment is more robust than nearest-center for right-aligned data:
+    # when a number's center falls slightly past the midpoint due to right-alignment,
+    # the zone boundary still gives the correct column.
+    _boundaries = [
+        (col_centers[i] + col_centers[i+1]) / 2
+        for i in range(len(col_centers) - 1)
+    ]
+
     def _assign(w):
         xc = (w['x0'] + w['x1']) / 2
-        # Schedule check FIRST — its x may be < part_bnd on some PDFs
+        # Schedule check FIRST (sched col may overlap part_bnd zone)
         if has_sched and abs(xc - sched_x) < 20:
             return 1
         if xc < part_bnd:
             return 0
-        ci = min(range(len(col_centers)), key=lambda i: abs(col_centers[i] - xc))
+        # Zone-based: find which interval xc falls into
+        ci = 0
+        for bi, bnd in enumerate(_boundaries):
+            if xc > bnd:
+                ci = bi + 1
+            else:
+                break
         return ci + (2 if has_sched else 1)
 
     rows_raw = _group_rows(words)
@@ -360,15 +416,39 @@ def _pp_col0_has_embedded_number(pp_data):
     return False
 
 
+# Matches a Schedule ref that ran into an adjacent number e.g. "L-48,568" or "L-51,234"
+_MERGED_SCHED_RE = re.compile(r'^L-\d+[,\d\(\)]+')
+
+
+def _pp_has_merged_schedule(pp_data):
+    """
+    Return True if pdfplumber merged a Schedule column reference (L-4, L-5 …)
+    with the adjacent data value into a single cell, e.g. "L-48,568".
+
+    This is the Shriram / Star-Union symptom: because there are no vertical grid
+    lines between the Schedule column and the first data column, pdfplumber treats
+    them as one cell.  header_cols handles this correctly.
+    Scans the first 30 data rows, all columns.
+    """
+    if not pp_data:
+        return False
+    for row in pp_data[3:30]:
+        for cell in row:
+            if cell and _MERGED_SCHED_RE.match(str(cell).strip()):
+                return True
+    return False
+
+
 def should_use_header_cols(page, pp_data):
     """
     Decide whether to use header_cols instead of pdfplumber for this page.
 
     Returns (use_hdr: bool, hdr_data: list|None)
 
-    Rule — prefer header_cols when EITHER:
+    Rule — prefer header_cols when ANY of:
       (a) header engine found MORE columns than pdfplumber  [pp under-detected cols]
       (b) pdfplumber col-0 contains an embedded number     [pp merged data into Particulars]
+      (c) pdfplumber has a merged Schedule+value cell       [e.g. "L-48,568" — Shriram/Star-Union]
     In all other cases, trust pdfplumber (e.g. HDFC with full vertical grid lines).
     """
     words = page.extract_words(x_tolerance=2, y_tolerance=4)
@@ -386,11 +466,13 @@ def should_use_header_cols(page, pp_data):
 
     reason_a = hdr_cols > pp_cols
     reason_b = _pp_col0_has_embedded_number(pp_data)
+    reason_c = _pp_has_merged_schedule(pp_data)   # "L-48,568" → Shriram/Star-Union
 
-    if reason_a or reason_b:
+    if reason_a or reason_b or reason_c:
         why = []
         if reason_a: why.append(f"hdr_cols({hdr_cols})>pp_cols({pp_cols})")
         if reason_b: why.append("pp col-0 has number")
+        if reason_c: why.append("pp merged schedule+value")
         logger.info(
             f"  Page {page.page_number} [header_cols chosen]: "
             f"{len(hdr_data)}r x {hdr_cols}c  reason={', '.join(why)}"
