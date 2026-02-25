@@ -8,8 +8,17 @@ import time
 import logging
 import tempfile
 from pathlib import Path
-
+import  base64
 import streamlit as st
+
+def get_base64_image(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+image_path = os.path.join(BASE_DIR, "pdf", "bajaj-life-logo.png")
+
+img_base64 = get_base64_image(image_path)
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -288,30 +297,53 @@ def main():
     _setup_logging()
 
     # ── Page title ────────────────────────────────────────────────────────────
-    col_logo, col_title, col_badge = st.columns([1, 8, 3], gap="small")
+    # Adjusted column ratios to give the logo more breathing room
+    col_logo, col_title, col_badge = st.columns([3, 4,2], gap="large", vertical_alignment="center")
+
     with col_logo:
         st.markdown(
-            '<div style="width:44px;height:44px;border-radius:12px;'
-            'background:linear-gradient(135deg,#1A56DB,#3B82F6);'
-            'display:flex;align-items:center;justify-content:center;'
-            'font-size:22px;box-shadow:0 2px 8px rgba(26,86,219,0.3);'
-            'margin-top:4px">📊</div>',
+            f'''
+            <div style="display: flex; align-items: center; justify-content: center;">
+                <img src="data:image/png;base64,{img_base64}" 
+                     style="width: 180px; height: auto; object-fit: contain; transform: scale(1.1);">
+            </div>
+            ''',
             unsafe_allow_html=True,
         )
+
     with col_title:
         st.markdown(
-            '<p style="margin:0;font-size:1.2rem;font-weight:700;color:#0F172A;line-height:1.2">'
-            'IRDAI PDF Extractor</p>'
-            '<p style="margin:2px 0 0;font-size:0.78rem;color:#64748B">'
-            'Convert public disclosure PDFs to structured Excel</p>',
+            '''
+            <div style="display: flex; flex-direction: column; justify-content: center;">
+                <h1 style="margin: 0; font-size: 1.8rem; font-weight: 800; color: #0F172A; line-height: 1;">
+                    IRDAI <span style="font-weight: 400; color: #64748B;">PDF Extractor</span>
+                </h1>
+                <p style="margin: 4px 0 0; font-size: 0.95rem; color: #64748B; font-weight: 400; max-width: 300px;">
+                    Enterprise-grade conversion of public disclosure PDFs to structured Excel
+                </p>
+            </div>
+            ''',
             unsafe_allow_html=True,
         )
+
     with col_badge:
         st.markdown(
-            '<div style="text-align:right;padding-top:8px">'
-            '<span style="background:#EFF6FF;border:1px solid #BFDBFE;color:#1D4ED8;'
-            'font-size:0.68rem;font-weight:600;padding:4px 12px;border-radius:999px;'
-            'white-space:nowrap">All FORM L-* supported</span></div>',
+            '''
+            <div style="display: flex; justify-content: flex-end;">
+                <span style="
+                    background: #F1F5F9; 
+                    border: 1px solid #E2E8F0; 
+                    color: #475569;
+                    font-size: 0.65rem; 
+                    font-weight: 700; 
+                    padding: 5px 10px; 
+                    border-radius: 4px;
+                    text-transform: uppercase;
+                    letter-spacing: 0.05em;">
+                    FORM L-SERIES • V2.0
+                </span>
+            </div>
+            ''',
             unsafe_allow_html=True,
         )
 
