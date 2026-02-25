@@ -29,7 +29,7 @@ except ImportError as e:
     sys.exit(1)
 
 from src.extractor          import TABLE_SETTINGS, process_table
-from src.extractor_gap      import extract_gap_based
+from src.extractor_gap      import extract_gap_based, should_use_header_cols
 from src.pdf_type_detector  import classify_page
 
 logging.basicConfig(
@@ -180,51 +180,55 @@ def make_sheet_name(pb, used):
 
 def _extract_page_pdfplumber(page, current_form):
     """
-    Engine 1: pdfplumber line-based extraction.
-    Falls back to gap-based when pdfplumber finds significantly fewer rows
-    than gap detection (handles pages where main table has no vertical lines
-    but pdfplumber catches only a smaller sub-table that has them).
+    Engine 1: pdfplumber line-based extraction with smart fallback.
+
+    Priority:
+      1. pdfplumber  — run first, always.
+      2. header_cols — override pdfplumber when it under-detects columns OR
+                       merges a data value into the Particulars column (col-0).
+                       Condition checked by should_use_header_cols().
+      3. gap-based   — fallback when gap scores >1.5x pdfplumber AND has >= cols.
     """
     text   = page.extract_text() or ""
     tables = page.find_tables(table_settings=TABLE_SETTINGS)
-    # Information score = rows × cols (total data cells)
-    # This correctly prefers 70r×22c (1540) over 69r×2c (138)
+
+    # ── Run pdfplumber first ──────────────────────────────────────────────────
     pp_rows = sum(len(t.extract()) for t in tables) if tables else 0
     pp_cols = max((len(t.extract()[0]) for t in tables if t.extract()), default=1) if tables else 1
     pp_score = pp_rows * pp_cols
 
-    # Try gap-based extraction
+    # Build the rebuilt pdfplumber table (needed for col-0 merge check)
+    pp_data = []
+    if tables:
+        pp_data = process_table(page, tables[0])
+
+    # ── Smart check: should we use header_cols instead? ───────────────────────
+    use_hdr, hdr_data = should_use_header_cols(page, pp_data)
+    if use_hdr and hdr_data:
+        return [{"type": "table", "data": hdr_data}]
+
+    # ── gap-based fallback (only when clearly better) ─────────────────────────
     gap_data = extract_gap_based(page)
     gap_rows = len(gap_data) if gap_data else 0
     gap_cols = len(gap_data[0]) if gap_data else 0
     gap_score = gap_rows * gap_cols
 
-    # Use gap only if it scores meaningfully better AND has more columns than pdfplumber
-    # (gap winning with fewer cols means it collapsed everything into 2 cols = bad)
-    use_gap = (
-        gap_data
-        and gap_score > pp_score * 1.5   # gap must be 50% more total cells
-        and gap_cols >= pp_cols           # gap must not have fewer columns
-    )
-
-    if use_gap:
+    if (gap_data and gap_score > pp_score * 1.5 and gap_cols >= pp_cols):
         logger.info(
-            f"  Page {page.page_number} [gap>pdfplumber score {gap_score}>{pp_score}]: "
-            f"{gap_rows}r × {gap_cols}c"
+            f"  Page {page.page_number} [gap>pdfplumber {gap_score}>{pp_score}]: "
+            f"{gap_rows}r x {gap_cols}c"
         )
         return [{"type": "table", "data": gap_data}]
 
+    # ── Use pdfplumber result ─────────────────────────────────────────────────
     content = []
     if tables:
         for t in tables:
-            raw    = t.extract()
-            is_idx = (len(raw) == 2 and raw[1] and
-                      any("\n" in str(c) for c in raw[1] if c))
             fin = process_table(page, t)
             content.append({"type": "table", "data": fin})
             logger.info(
                 f"  Page {page.page_number} [pdfplumber]: "
-                f"{len(fin)}r × {len(fin[0]) if fin else 0}c"
+                f"{len(fin)}r x {len(fin[0]) if fin else 0}c"
             )
     else:
         lines = [l for l in text.split("\n") if l.strip()]
@@ -235,18 +239,22 @@ def _extract_page_pdfplumber(page, current_form):
 
 
 def _extract_page_gap(page, current_form):
-    """Engine 2: gap-based for h_only PDFs."""
+    """Engine 2: gap-based for h_only PDFs. Tries header_cols when applicable."""
     content = []
-    rows    = extract_gap_based(page)
 
+    # For h_only pages that ARE segmental forms (many col headers), use header_cols
+    use_hdr, hdr_data = should_use_header_cols(page, None)
+    if use_hdr and hdr_data:
+        return [{"type": "table", "data": hdr_data}]
+
+    rows = extract_gap_based(page)
     if rows:
         content.append({"type": "table", "data": rows})
         logger.info(
             f"  Page {page.page_number} [gap-based]: "
-            f"{len(rows)}r × {len(rows[0]) if rows else 0}c"
+            f"{len(rows)}r x {len(rows[0]) if rows else 0}c"
         )
     else:
-        # Fallback to plain text
         text  = page.extract_text() or ""
         lines = [l for l in text.split("\n") if l.strip()]
         if lines:
@@ -363,7 +371,13 @@ def extract_document(pdf_path: str, force_docling: bool = False) -> list:
 # EXCEL WRITER  (unchanged)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def write_excel(document: list, output_path: str):
+def write_excel(document: list, output_path=None):
+    """
+    Build and save workbook.
+    output_path: str  -> save to disk AND return bytes
+    output_path: None -> return bytes only (used by Streamlit)
+    """
+    import io as _io
     wb, used = Workbook(), set()
     wb.remove(wb.active)
 
@@ -385,6 +399,8 @@ def write_excel(document: list, output_path: str):
                 nc = max(len(r) for r in td)
                 for ri, row in enumerate(td):
                     row = list(row) + [""] * (nc - len(row))
+                    if not any(str(v).strip() for v in row):
+                        continue
                     rt  = classify_row(row, ri, pb.get("is_index", False))
                     apply_style(ws, cr, row, rt, nc)
                     cr += 1
@@ -399,13 +415,21 @@ def write_excel(document: list, output_path: str):
         set_col_widths(ws)
         ws.freeze_panes = "A2"
 
-    try:
-        wb.save(output_path)
-        size_kb = os.path.getsize(output_path) // 1024
-        logger.info(f"Saved '{output_path}' ({size_kb} KB, {len(document)} sheets)")
-    except PermissionError:
-        logger.error(f"File is open — close it first: {output_path}")
-        sys.exit(1)
+    buf = _io.BytesIO()
+    wb.save(buf)
+    raw = buf.getvalue()
+
+    if output_path and isinstance(output_path, str):
+        try:
+            with open(output_path, "wb") as f:
+                f.write(raw)
+            size_kb = len(raw) // 1024
+            logger.info(f"Saved '{output_path}' ({size_kb} KB, {len(document)} sheets)")
+        except PermissionError:
+            logger.error(f"File is open — close it first: {output_path}")
+            sys.exit(1)
+
+    return raw
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -3,3 +3,4 @@ openpyxl>=3.1.0
 docling
 torch
 torchvision
+pypdf

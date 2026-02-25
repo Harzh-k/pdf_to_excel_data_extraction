@@ -1,150 +1,166 @@
-# IRDAI PDF → Excel Extractor
+# IRDAI PDF Extractor
 
-Automatically extracts tables from IRDAI insurance company public disclosure PDFs and outputs a clean, formatted Excel file — one sheet per table.
-
-Built to handle the complex multi-column structure of IRDAI forms (e.g. FORM L-1-A-RA with 20 sub-columns across LINKED / PARTICIPATING / NON-PARTICIPATING business segments).
+> Convert IRDAI public disclosure PDFs into clean, structured Excel files — automatically, with no manual cleanup.
 
 ---
 
-## The Problem This Solves
+## What It Does
 
-IRDAI public disclosure PDFs have tables with space-separated sub-columns that standard PDF extractors (pdfplumber, Adobe, etc.) collapse into a single merged cell. For example, `FORM L-1-A-RA` has 20 data columns but pdfplumber detects only 9.
+Insurance companies regulated by IRDAI file quarterly disclosure PDFs containing dense multi-segment financial tables: Revenue Accounts (L-1-A-RA), P&L, Balance Sheets, and supporting schedules. These PDFs are notoriously difficult to parse because:
 
-This tool detects and correctly rebuilds those tables using coordinate-based column detection.
+- Tables span 18–22 columns with no vertical grid lines
+- Column headers (`LIFE`, `PENSION`, `HEALTH`…) are repeated across segments
+- The `Schedule` reference column (`L-4`, `L-5`…) silently merges into `Particulars`
+- Some PDFs use character-level font encoding that scrambles header text
+
+This tool extracts every table from every page into a formatted multi-sheet Excel workbook — one sheet per page, headers styled in navy, totals bolded, numbers right-aligned.
 
 ---
 
-## Project Structure
+## Supported Insurers & Forms
+
+| Category | Details |
+|---|---|
+| **Insurer types** | Life, Health, General (any IRDAI filer) |
+| **Forms** | All `FORM L-*` types: L-1-A-RA, L-2-A-PL, L-3-A-BS, L-4 through L-7, L-25, L-26, and all others |
+| **Tested insurers** | HDFC Life, Tata AIA, Aditya Birla, Bajaj Allianz, ICICI Prudential, LIC, Canara HSBC, Shriram Life, Star Union, Bandhan Life |
+| **Page orientations** | Portrait (612px) and Landscape (792px+) |
+
+---
+
+## Architecture
+
+The extractor uses a **3-engine hybrid** that classifies each page and routes it to the best parser:
 
 ```
-irdai-pdf-extractor/
-│
-├── extract_tables_smart_merged.py   # Main script — run this
+PDF page
+   │
+   ▼
+pdf_type_detector.classify_page()
+   │
+   ├── "lines"    → pdfplumber (vertical grid lines present)
+   │                  └── smart override: should_use_header_cols()
+   │                        ├── header_cols engine  (when pp merges columns)
+   │                        └── pdfplumber          (when pp is correct)
+   │
+   ├── "h_only"   → header_cols engine  (LIFE/PENSION/HEALTH detection)
+   │                  └── fallback: gap-based clustering
+   │
+   ├── "no_lines" → docling (ML-based, optional)
+   │                  └── fallback: gap-based
+   │
+   └── "scanned"  → docling with OCR
+```
+
+### Engine Details
+
+**Engine 1 — pdfplumber** (`src/extractor.py`)
+Uses PDF line geometry to detect table cells. Fast and accurate for PDFs with full vertical grids (e.g. HDFC Life).
+
+**Engine 2 — header_cols** (`src/extractor_gap.py → extract_header_cols`)
+The key innovation for IRDAI disclosures. Instead of relying on grid lines, it:
+1. Finds the row with the most `LIFE / PENSION / HEALTH / ANNUITY / TOTAL` keyword hits
+2. Records the x-center of each keyword as a column anchor
+3. Scans all rows for `GRAND … TOTAL` to capture the Grand Total column
+4. Assigns every word on every data row to its nearest column anchor
+5. Detects `L-4`, `L-5`… schedule reference words and places them in a dedicated `Schedule` column
+
+This correctly separates `Particulars | Schedule | LIFE | PENSION | … | GRAND TOTAL` for all 19-20 column segmental forms.
+
+**Smart selector — `should_use_header_cols()`**
+Runs pdfplumber first, then overrides with header_cols when either:
+- `header_cols` detected more columns than pdfplumber (pdfplumber under-detected)
+- pdfplumber's col-0 contains an embedded number (pdfplumber merged data into Particulars)
+
+This ensures HDFC Life (full vertical grid → pdfplumber 22c ✓) and Tata AIA (no verticals → header_cols 20c ✓) both get the right engine automatically.
+
+**Engine 3 — gap-based** (`src/extractor_gap.py → extract_gap_based`)
+Clusters numeric token x-positions to detect columns. Used as fallback for simple multi-column pages without LIFE/PENSION headers (e.g. Aditya Birla schedule pages).
+
+**Engine 4 — docling** (`src/extractor_docling.py`)
+ML-based table detection for scanned or zero-line PDFs. Optional — install separately.
+
+---
+
+## File Structure
+
+```
+.
+├── app.py                        # Streamlit UI
+├── extract_tables_smart_merged.py # CLI entry point & orchestrator
 ├── src/
-│   └── extractor.py                 # Core extraction & rebuild engine
-├── requirements.txt
+│   ├── extractor.py              # pdfplumber engine + table post-processing
+│   ├── extractor_gap.py          # gap-based + header_cols engines + smart selector
+│   ├── extractor_docling.py      # docling/OCR engine (optional)
+│   └── pdf_type_detector.py      # per-page classifier (lines/h_only/no_lines/scanned)
 └── README.md
 ```
 
 ---
 
-## Requirements
-
-- Python 3.8+
-- pdfplumber
-- openpyxl
-
-Install dependencies:
+## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install pdfplumber openpyxl streamlit
+```
+
+Optional (for scanned PDFs):
+```bash
+pip install docling torch torchvision
 ```
 
 ---
 
 ## Usage
 
+### Web UI
 ```bash
-python extract_tables_smart_merged.py <pdf_path> [output_path]
+streamlit run app.py
+```
+Open `http://localhost:8501`, upload a PDF, click **Extract to Excel**, download.
+
+### Command Line
+```bash
+python extract_tables_smart_merged.py path/to/disclosure.pdf [output.xlsx]
+
+# Force docling for all pages:
+python extract_tables_smart_merged.py disclosure.pdf output.xlsx --force-docling
 ```
 
-**Examples:**
 
-```bash
-# Output file auto-named from PDF
-python extract_tables_smart_merged.py HDFC_Life_Q3_2025.pdf
+## Excel Output Format
 
-# Custom output path
-python extract_tables_smart_merged.py HDFC_Life_Q3_2025.pdf output/HDFC_extracted.xlsx
-```
+Each page → one sheet, named `P{n}_{FORM_CODE}` (e.g. `P3_L-1-A-RA`).
 
----
-
-## Output
-
-- One Excel file with **one sheet per table**
-- Sheet names follow the pattern: `L-1-A-RA_P3` (form code + page number)
-- If a page has multiple tables: `L-1-A-RA_P3_T2`
-
-### Formatting
-
-| Row Type | Style |
+| Row type | Style |
 |---|---|
-| Page / Form header | Dark navy / IRDAI red background |
-| Column headers (LIFE, PENSION...) | Blue background, white bold text |
-| Total / Sub Total rows | Light green background, thin border |
-| Normal data rows | No borders, clean white |
+| Sheet title | Navy fill, white bold text |
+| Column headers (`LIFE`, `PENSION`…) | Navy fill, white bold, centered |
+| Total rows (`TOTAL (A)`, `SURPLUS`…) | Bold, thin top/bottom border |
+| Section headings | Bold, no fill |
+| Form metadata | Small grey italic |
+| Data rows | Normal, numbers right-aligned |
+
+Empty rows and footer rows (`Version:`, `Date of upload:`) are suppressed automatically.
 
 ---
 
-## How It Works
+## Known Limitations
 
-### The Core Problem
-Standard PDF extractors use line-detection to find columns. IRDAI tables have **horizontal lines only** — sub-columns are separated by whitespace, not vertical lines. This causes pdfplumber to merge all sub-columns into one cell.
-
-### The Fix (in `src/extractor.py`)
-
-1. **`header_needs_rebuild()`** — detects if pdfplumber has incorrectly merged columns by looking for IRDAI column keywords (LIFE, PENSION, HEALTH, ANNUITY, VAR.INS) in the same cell
-
-2. **`rebuild_using_header_spans()`** — rebuilds the table from scratch:
-   - Extracts all words from the table bbox
-   - Finds the true column header row (row with most spaced-out words)
-   - Merges adjacent header words within 3px (handles `VAR.` + `INS` → `VAR. INS`)
-   - Computes column boundaries as midpoints between column groups
-   - Assigns every word to the correct column using x-center position
-
-3. **Column layout** (verified on HDFC pdf2.pdf):
-   - `x < 230` → Particulars column
-   - `230 ≤ x < 257` → Schedule column  
-   - `x ≥ 257` → Data columns (LIFE, PENSION, HEALTH, VAR.INS, TOTAL × 3 segments)
-
-4. **Split number fix** — pdfplumber occasionally splits numbers like `5,36,897` into `5` + `,36,897` due to char-level spacing. Post-processing regex merges these back.
-
----
-
-## Supported Forms
-
-Tested on HDFC Life Insurance IRDAI Public Disclosures (December 2025):
-
-| Form | Description | Columns |
-|---|---|---|
-| L-1-A-RA | Revenue Account | 20 |
-| L-2-A-PL | Profit & Loss Account | 4 |
-| L-3-A-BS | Balance Sheet | 3 |
-| L-4 to L-45 | Various schedules | varies |
-
----
-
-## Accuracy
-
-| Scenario | Accuracy |
+| Issue | Status |
 |---|---|
-| FORM L-1-A-RA (Revenue Account) | ~95% |
-| Simple 4–6 column forms | ~90% |
-| Overall on full HDFC 92-page PDF | ~85% |
-
-Accuracy across other companies' PDFs may vary slightly depending on column x-positions. The detection is dynamic (not hardcoded), so it adapts to most standard IRDAI layouts.
+| Scanned / image-only PDFs | Requires `docling` install |
+| Star Union value alignment on landscape pages | In progress |
+| HDFC fine-tune (minor) | Tracked |
 
 ---
 
-## Limitations
+## How the Schedule Column Works
 
-- Scanned PDFs (image-based) are not supported — PDF must have selectable text
-- Very complex forms like L-27 (ULIP Fund, 13 pages) may need manual review
-- `particulars_boundary=230` and `schedule_boundary=257` are calibrated for standard IRDAI layouts — extreme outliers may need adjustment in `extractor.py`
+Every segmental form has a hidden column between `Particulars` and the first data column containing schedule references like `L-4`, `L-5`, `L-6`, `L-7`. Most PDF parsers miss it because it has no vertical separator from `Particulars`.
 
----
-
-## Contributing
-
-Pull requests welcome. If you find a form type that extracts incorrectly:
-
-1. Note the form name and page number
-2. Run the diagnostic script to get word coordinates
-3. Open an issue with the output
+The header_cols engine detects it by scanning for words matching `^L-\d` and recording their minimum x-position as `sched_x`. During word assignment, the Schedule check runs *before* the Particulars boundary check, so `L-4` at x=156px (which is less than `part_boundary=167px`) still correctly lands in col-1 rather than col-0.
 
 ---
 
-## License
-
-MIT License — free to use, modify, and distribute.
+*Built for processing IRDAI quarterly public disclosures. All FORM L-* types supported.*
