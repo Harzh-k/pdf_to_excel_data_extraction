@@ -19,11 +19,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 image_path = os.path.join(BASE_DIR, "pdf", "bajaj-life-logo.png")
 
 img_base64 = get_base64_image(image_path)
-
+LOGO_IMAGE = "https://la.bajajlife.com/assets/Icons/General/BalicLogo2.png"
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="IRDAI Extractor",
-    page_icon="📊",
+    page_icon=LOGO_IMAGE,
     layout="centered",
     initial_sidebar_state="collapsed",
 )
