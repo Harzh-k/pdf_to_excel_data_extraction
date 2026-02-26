@@ -7,8 +7,9 @@ import os
 import time
 import logging
 import tempfile
+import base64
 from pathlib import Path
-import  base64
+
 import streamlit as st
 
 def get_base64_image(path):
@@ -20,6 +21,7 @@ image_path = os.path.join(BASE_DIR, "pdf", "bajaj-life-logo.png")
 
 img_base64 = get_base64_image(image_path)
 LOGO_IMAGE = "https://la.bajajlife.com/assets/Icons/General/BalicLogo2.png"
+
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Drag-n-Fly",
@@ -252,11 +254,11 @@ def _log_html() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Extraction  — identical to CLI  (extract_document + write_excel)
+# Extraction  — with live per-page progress callback
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
-def _run_extraction(pdf_bytes: bytes):
+def _run_extraction_with_progress(pdf_bytes: bytes, on_page=None):
+    """Run extraction and build Excel, firing on_page(n, total, form) per page."""
     from extract_tables_smart_merged import extract_document, write_excel
 
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
@@ -264,7 +266,7 @@ def _run_extraction(pdf_bytes: bytes):
         tmp_path = tmp.name
 
     try:
-        document = extract_document(tmp_path)
+        document = extract_document(tmp_path, on_page=on_page)
 
         pages_seen, tables, forms = set(), 0, set()
         for pb in document:
@@ -275,7 +277,7 @@ def _run_extraction(pdf_bytes: bytes):
                 if item.get("type") == "table":
                     tables += 1
 
-        excel_bytes = write_excel(document)   # returns raw bytes
+        excel_bytes = write_excel(document)
 
         stats = {
             "pages":  max(pages_seen) if pages_seen else 0,
@@ -289,6 +291,13 @@ def _run_extraction(pdf_bytes: bytes):
         os.unlink(tmp_path)
 
 
+def _count_pdf_pages(pdf_bytes: bytes) -> int:
+    """Quick page count without full extraction."""
+    import pdfplumber, io
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        return len(pdf.pages)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UI — uses only native Streamlit widgets, NO div-wrapping tricks
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,17 +306,16 @@ def main():
     _setup_logging()
 
     # ── Page title ────────────────────────────────────────────────────────────
-    # Adjusted column ratios to give the logo more breathing room
-    col_logo, col_title, col_badge = st.columns([3, 6,2], gap="large", vertical_alignment="center")
+    col_logo, col_title, col_badge = st.columns([3, 6, 2], gap="large", vertical_alignment="center")
 
     with col_logo:
         st.markdown(
             f'''
-            <div style="display: flex; align-items: center; justify-content: center;">
-                <img src="data:image/png;base64,{img_base64}" 
-                     style="width: 180px; height: auto; object-fit: contain; transform: scale(1.1);">
-            </div>
-            ''',
+                <div style="display: flex; align-items: center; justify-content: center;">
+                    <img src="data:image/png;base64,{img_base64}" 
+                         style="width: 180px; height: auto; object-fit: contain; transform: scale(1.1);">
+                </div>
+                ''',
             unsafe_allow_html=True,
         )
 
@@ -315,10 +323,10 @@ def main():
         st.markdown(
             '''
             <div style="display: flex; flex-direction: column; justify-content: center;">
-                <h1 style="margin: 0; font-size: 1.8rem; font-weight: 100; color: #0F172A; line-height: 1;">
-                     <span style="font-weight: 400; color: #000000;">Drag-n-Fly</span>
+                <h1 style="margin: 0; font-size: 1.8rem; font-weight: 500; color: #000000; text-align: center; line-height: 1;">
+                     Drag-n-Fly
                 </h1>
-                <p style="margin: 4px 0 0; font-size: 0.95rem; color: #64748B; font-weight: 400; max-width: 300px;">
+                <p style=" font-size: 0.95rem; color: #64748B; text-align: center; font-weight: 400; ">
                     Powered By Bajaj Life Gen AI Workbench.
                 </p>
             </div>
@@ -418,17 +426,37 @@ def main():
         for k in ("excel_bytes", "stats", "logs"):
             st.session_state.pop(k, None)
 
-        prog = prog_slot.progress(0, text="Reading PDF…")
-        msg_slot.info("Processing — may take a moment for large files…", icon="⏳")
-
         try:
-            pdf_bytes = uploaded.read()
-            prog.progress(20, text="Detecting page types…")
-            excel_bytes, stats = _run_extraction(pdf_bytes)
-            prog.progress(95, text="Building Excel…")
-            time.sleep(0.25)
-            prog.progress(100, text="Done ✓")
-            time.sleep(0.3)
+            pdf_bytes  = uploaded.read()
+            total_pages = _count_pdf_pages(pdf_bytes)
+
+            # Seed progress at 0
+            prog = prog_slot.progress(
+                0,
+                text=f"📄 Page 0 / {total_pages} — reading PDF…"
+            )
+            msg_slot.info(
+                f"Extracting **{total_pages}** pages — please wait…",
+                icon="⏳"
+            )
+
+            # Callback fired by extract_document after each page
+            def _on_page(page_num, total, form_name):
+                pct  = int(page_num / total * 90)   # reserve last 10% for Excel build
+                form = f" · {form_name}" if form_name else ""
+                prog.progress(
+                    pct,
+                    text=f"📄 Page {page_num} / {total}{form}"
+                )
+
+            excel_bytes, stats = _run_extraction_with_progress(
+                pdf_bytes, on_page=_on_page
+            )
+
+            prog.progress(95, text="🔨 Building Excel…")
+            time.sleep(0.2)
+            prog.progress(100, text=f"✅ Done — {total_pages} pages extracted")
+            time.sleep(0.4)
             prog_slot.empty()
             msg_slot.empty()
             st.session_state["excel_bytes"] = excel_bytes

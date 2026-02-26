@@ -318,7 +318,8 @@ def _extract_page_gap(page, current_form):
     return content
 
 
-def extract_document(pdf_path: str, force_docling: bool = False) -> list:
+def extract_document(pdf_path: str, force_docling: bool = False,
+                     on_page=None) -> list:
     """
     Main extraction entry point.
     Automatically routes each page to the right engine.
@@ -326,6 +327,8 @@ def extract_document(pdf_path: str, force_docling: bool = False) -> list:
     Args:
         pdf_path:      path to PDF file
         force_docling: skip detection, use docling for ALL pages
+        on_page:       optional callable(page_num, total_pages, form_name)
+                       called after each page is processed — used for progress UI
 
     Returns: list of page_block dicts
     """
@@ -383,6 +386,13 @@ def extract_document(pdf_path: str, force_docling: bool = False) -> list:
                         pb["is_index"] = True
 
             document.append(pb)
+
+            # Fire progress callback so UI can show live page count
+            if on_page:
+                try:
+                    on_page(pg_num, total, current_form)
+                except Exception:
+                    pass
 
     # ── Docling pass for no_lines / scanned pages ─────────────────────────────
     if docling_pages:
