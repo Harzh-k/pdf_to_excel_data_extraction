@@ -156,6 +156,228 @@ def _assign_by_boundary(xc, boundaries, num_cols):
     return min(ci, num_cols - 1)
 
 
+# Split "L-14-Investments - Assets …" → ("L-14", "Investments - Assets …")
+_FORM_SPLIT_RE = re.compile(
+    r'^(L-[\dA-Za-z]+(?:\s*&\s*L[\dA-Za-z]+)?'
+    r'(?:\s*\([^)]+\)\s*&\s*\([^)]+\))?)'
+    r'\s*-\s*(.+)$'
+)
+
+
+def detect_index_page(words):
+    """
+    Return True if this page is a TOC / index-of-forms page.
+
+    Handles two IRDAI formats:
+    Format A (Axis/Shriram/most insurers):
+        Header row has 'Description' AND 'Pages' as separate words
+        Data rows: Sl.No | Form No | Description | Pages
+
+    Format B (ICICI Prudential and some others):
+        Header row has 'Sr.' / 'No.' / 'Form' — no separate Description/Pages columns
+        Form No and Description are fused: "L-1-Revenue Account"
+        Data rows: Sr.No | L-N-Description  (no Pages column)
+    """
+    rows = _group_rows(words)
+    for row in rows[:15]:
+        texts = {w['text'] for w in row}
+
+        # Format A: standard 4-col index with Description + Pages headers
+        if 'Description' in texts and 'Pages' in texts:
+            return True
+
+        # Format B: ICICI-style — header has Sr./No./Form but no Description/Pages
+        # and data rows have fused "L-N-…" cells
+        if {'Sr.', 'Form'}.issubset(texts):
+            return True
+
+    return False
+
+
+def extract_index_page(page):
+    """
+    Engine INDEX: extracts the IRDAI 'List of Website Disclosures' table
+    that appears as a ToC at the start of every insurer's PDF.
+
+    The table has 4 columns:
+      Sl. No. | Form No. | Description | Pages
+
+    pdfplumber and gap-based both fail here because the three left columns
+    (Sl.No / Form No / Description) have no visible column separators, so they
+    get merged into one cell.  We split them by fixed x-boundaries derived from
+    the actual word positions in the header row.
+
+    Returns list of rows (list of str), or None if detection fails.
+    """
+    words = page.extract_words(x_tolerance=2, y_tolerance=4)
+    if not words:
+        return None
+
+    if not detect_index_page(words):
+        return None
+
+    rows = _group_rows(words)
+
+    # ── Detect which format ───────────────────────────────────────────────────
+    is_format_b = False   # ICICI-style: fused "L-N-Description", no Pages column
+    header_ri   = None
+    pages_x     = None
+
+    for ri, row in enumerate(rows[:15]):
+        texts = {w['text'] for w in row}
+        if 'Description' in texts and 'Pages' in texts:
+            header_ri = ri
+            for w in row:
+                if w['text'] == 'Pages':
+                    pages_x = w['x0'] - 5
+                    break
+            break
+        if {'Sr.', 'Form'}.issubset(texts) and 'Description' not in texts:
+            header_ri  = ri
+            is_format_b = True
+            break
+
+    if header_ri is None:
+        return None
+
+    # ── FORMAT B — ICICI: split fused "L-N-Description" cells ────────────────
+    if is_format_b:
+        result = []
+        # Header row → output 3 clean column headers
+        result.append(['Sr. No.', 'Form No.', 'Description'])
+
+        # First pass: collect raw entries preserving the weird layout
+        # Pattern: some rows have only the form entry (no Sr.No), and
+        # the Sr.No appears on the NEXT row as an orphan.
+        # e.g. row16="L-14-Investments..." row17="14"
+        # We need to look ahead: if the NEXT row has only a number and no form ref,
+        # that number is the Sr.No for the CURRENT entry.
+        i = header_ri + 1
+        while i < len(rows):
+            row = rows[i]
+            if not row:
+                i += 1
+                continue
+
+            row_sorted = sorted(row, key=lambda w: w['x0'])
+            sr_text   = ''
+            rest_text = ''
+            for w in row_sorted:
+                if w['x0'] < 135:
+                    sr_text += (' ' if sr_text else '') + w['text']
+                else:
+                    rest_text += (' ' if rest_text else '') + w['text']
+
+            flat = (sr_text + ' ' + rest_text).strip()
+            if not flat or _FOOTER_HDR_RE.search(flat):
+                i += 1
+                continue
+
+            # Case 1: normal row — has both Sr.No and form entry
+            if sr_text and rest_text:
+                m = _FORM_SPLIT_RE.match(rest_text.strip())
+                if m:
+                    result.append([sr_text.strip(), m.group(1).strip(), m.group(2).strip()])
+                else:
+                    result.append([sr_text.strip(), rest_text.strip(), ''])
+                i += 1
+                continue
+
+            # Case 2: only a form entry, no Sr.No — check if NEXT row is orphan number
+            if rest_text and not sr_text:
+                # Look ahead for an orphan number row
+                orphan_sr = ''
+                if i + 1 < len(rows):
+                    next_row = rows[i + 1]
+                    next_sorted = sorted(next_row, key=lambda w: w['x0'])
+                    next_sr   = ' '.join(w['text'] for w in next_sorted if w['x0'] < 135)
+                    next_rest = ' '.join(w['text'] for w in next_sorted if w['x0'] >= 135)
+                    # If next row has only a number and no form-ref text, it's orphan Sr.No
+                    if next_sr and not next_rest and next_sr.strip().isdigit():
+                        orphan_sr = next_sr.strip()
+                        i += 1  # consume the orphan row
+
+                m = _FORM_SPLIT_RE.match(rest_text.strip())
+                if m:
+                    result.append([orphan_sr, m.group(1).strip(), m.group(2).strip()])
+                else:
+                    result.append([orphan_sr, rest_text.strip(), ''])
+                i += 1
+                continue
+
+            # Case 3: only an orphan Sr.No (no rest_text) — attach to previous entry
+            if sr_text and not rest_text:
+                if result and not result[-1][0]:
+                    result[-1][0] = sr_text.strip()
+                i += 1
+                continue
+
+            i += 1
+
+        return result or None
+
+    # ── FORMAT A — Standard 4-col index ──────────────────────────────────────
+    if pages_x is None:
+        return None
+
+    # Derive left-column boundaries from the header row.
+    # Note: 'Description' header is CENTER-aligned in its column (x0~275),
+    # but description TEXT is LEFT-aligned starting at ~x0=110.
+    # Use the right edge of Form No cluster + 5px, not midpoint to Description.
+    hdr_row = rows[header_ri]
+    form_x  = None
+    desc_x  = None
+
+    hdr_words_sorted = sorted(hdr_row, key=lambda w: w['x0'])
+    seen_x = []
+    for w in hdr_words_sorted:
+        if not seen_x or (w['x0'] - seen_x[-1]) > 20:
+            seen_x.append(w['x0'])
+
+    if len(seen_x) >= 2:
+        form_x = (seen_x[0] + seen_x[1]) / 2
+
+    if form_x and pages_x:
+        form_col_words = [
+            w for w in hdr_row
+            if w['x0'] >= (form_x or 50) and w['x0'] < pages_x / 2
+            and w['text'] not in ('Description', 'Pages')
+        ]
+        if form_col_words:
+            desc_x = max(w['x1'] for w in form_col_words) + 5
+        else:
+            desc_x = (seen_x[1] if len(seen_x) > 1 else 63) + 40
+
+    if form_x is None: form_x = 50
+    if desc_x is None: desc_x = 105
+
+    # ── Build Format A output rows ────────────────────────────────────────────
+    result = []
+    for ri, row in enumerate(rows):
+        if ri < header_ri:
+            continue          # skip title/header rows above the table
+
+        cells = ['', '', '', '']
+        for w in row:
+            x = w['x0']
+            if x < form_x:
+                cells[0] += (' ' if cells[0] else '') + w['text']
+            elif x < desc_x:
+                cells[1] += (' ' if cells[1] else '') + w['text']
+            elif x < pages_x:
+                cells[2] += (' ' if cells[2] else '') + w['text']
+            else:
+                cells[3] += (' ' if cells[3] else '') + w['text']
+
+        # Skip footer-only rows and completely blank rows
+        flat = ' '.join(c for c in cells if c)
+        if not flat or _FOOTER_HDR_RE.search(flat):
+            continue
+        result.append([c.strip() for c in cells])
+
+    return result or None
+
+
 def extract_gap_based(page, bbox=None):
     """
     Engine A: gap-based column detection.

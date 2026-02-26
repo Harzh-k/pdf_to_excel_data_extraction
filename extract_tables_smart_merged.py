@@ -29,7 +29,7 @@ except ImportError as e:
     sys.exit(1)
 
 from src.extractor          import TABLE_SETTINGS, process_table
-from src.extractor_gap      import extract_gap_based, should_use_header_cols
+from src.extractor_gap      import extract_gap_based, should_use_header_cols, extract_index_page, detect_index_page
 from src.pdf_type_detector  import classify_page
 
 logging.basicConfig(
@@ -183,12 +183,25 @@ def _extract_page_pdfplumber(page, current_form):
     Engine 1: pdfplumber line-based extraction with smart fallback.
 
     Priority:
+      0. index_page  — TOC/index pages (Sl.No / Form No / Description / Pages)
+                       pdfplumber collapses all 3 left cols into one cell.
       1. pdfplumber  — run first, always.
       2. header_cols — override pdfplumber when it under-detects columns OR
                        merges a data value into the Particulars column (col-0).
                        Condition checked by should_use_header_cols().
       3. gap-based   — fallback when gap scores >1.5x pdfplumber AND has >= cols.
     """
+    # ── Priority 0: Index/TOC page ────────────────────────────────────────────
+    words = page.extract_words(x_tolerance=2, y_tolerance=4)
+    if detect_index_page(words):
+        idx_data = extract_index_page(page)
+        if idx_data:
+            logger.info(
+                f"  Page {page.page_number} [index_page]: "
+                f"{len(idx_data)}r x {len(idx_data[0]) if idx_data else 0}c"
+            )
+            return [{"type": "table", "data": idx_data}]
+
     text   = page.extract_text() or ""
     tables = page.find_tables(table_settings=TABLE_SETTINGS)
 
@@ -241,6 +254,17 @@ def _extract_page_pdfplumber(page, current_form):
 def _extract_page_gap(page, current_form):
     """Engine 2: gap-based for h_only PDFs. Tries header_cols when applicable."""
     content = []
+
+    # ── Priority 0: Index/TOC page (works for both lines and h_only pages) ───
+    words = page.extract_words(x_tolerance=2, y_tolerance=4)
+    if detect_index_page(words):
+        idx_data = extract_index_page(page)
+        if idx_data:
+            logger.info(
+                f"  Page {page.page_number} [index_page]: "
+                f"{len(idx_data)}r x {len(idx_data[0]) if idx_data else 0}c"
+            )
+            return [{"type": "table", "data": idx_data}]
 
     # For h_only pages that ARE segmental forms (many col headers), use header_cols
     use_hdr, hdr_data = should_use_header_cols(page, None)

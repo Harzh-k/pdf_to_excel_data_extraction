@@ -22,7 +22,7 @@ img_base64 = get_base64_image(image_path)
 LOGO_IMAGE = "https://la.bajajlife.com/assets/Icons/General/BalicLogo2.png"
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="IRDAI Extractor",
+    page_title="Drag-n-Fly",
     page_icon=LOGO_IMAGE,
     layout="centered",
     initial_sidebar_state="collapsed",
@@ -298,7 +298,7 @@ def main():
 
     # ── Page title ────────────────────────────────────────────────────────────
     # Adjusted column ratios to give the logo more breathing room
-    col_logo, col_title, col_badge = st.columns([3, 4,2], gap="large", vertical_alignment="center")
+    col_logo, col_title, col_badge = st.columns([3, 6,2], gap="large", vertical_alignment="center")
 
     with col_logo:
         st.markdown(
@@ -315,11 +315,11 @@ def main():
         st.markdown(
             '''
             <div style="display: flex; flex-direction: column; justify-content: center;">
-                <h1 style="margin: 0; font-size: 1.8rem; font-weight: 800; color: #0F172A; line-height: 1;">
-                    IRDAI <span style="font-weight: 400; color: #64748B;">PDF Extractor</span>
+                <h1 style="margin: 0; font-size: 1.8rem; font-weight: 100; color: #0F172A; line-height: 1;">
+                    Powered by <span style="font-weight: 400; color: #64748B;">Drag-n-Fly</span>
                 </h1>
                 <p style="margin: 4px 0 0; font-size: 0.95rem; color: #64748B; font-weight: 400; max-width: 300px;">
-                    Enterprise-grade conversion of public disclosure PDFs to structured Excel
+                    Converting public disclosure PDFs to structured Excel
                 </p>
             </div>
             ''',
