@@ -226,9 +226,39 @@ def _extract_page_pdfplumber(page, current_form):
     gap_cols = len(gap_data[0]) if gap_data else 0
     gap_score = gap_rows * gap_cols
 
+    # ── NEW: detect spurious empty columns in pdfplumber output ───────────────
+    # When pdfplumber detects phantom vertical lines (e.g. a thin guide column
+    # at the left margin), it generates columns that are 100% empty in data rows.
+    # In that case, prefer gap-based if it produces a cleaner result.
+    def _pp_has_empty_cols(data, skip_rows=5):
+        """Return True if pdfplumber output has any 100%-empty middle column."""
+        if not data or len(data[0]) < 3:
+            return False
+        data_rows = data[skip_rows:] if len(data) > skip_rows else data
+        if not data_rows:
+            return False
+        ncols = len(data[0])
+        for ci in range(1, ncols - 1):  # skip first and last col
+            nonempty = sum(1 for row in data_rows if ci < len(row) and row[ci] not in ('', None))
+            if nonempty == 0:
+                return True
+        return False
+
+    pp_has_phantom = pp_data and _pp_has_empty_cols(pp_data)
+
     if (gap_data and gap_score > pp_score * 1.5 and gap_cols >= pp_cols):
         logger.info(
             f"  Page {page.page_number} [gap>pdfplumber {gap_score}>{pp_score}]: "
+            f"{gap_rows}r x {gap_cols}c"
+        )
+        return [{"type": "table", "data": gap_data}]
+
+    # If pp has phantom empty columns and gap gives a simpler result, use gap
+    # Only apply this for small tables (pp_cols <= 8). Wide tables (20+ cols)
+    # may have structural empty columns that are legitimate, and gap often under-extracts them.
+    if pp_has_phantom and gap_data and gap_cols >= 2 and pp_cols <= 8:
+        logger.info(
+            f"  Page {page.page_number} [gap>pp (phantom cols) {gap_cols}c<{pp_cols}c]: "
             f"{gap_rows}r x {gap_cols}c"
         )
         return [{"type": "table", "data": gap_data}]

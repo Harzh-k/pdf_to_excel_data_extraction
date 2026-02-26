@@ -316,10 +316,10 @@ def main():
             '''
             <div style="display: flex; flex-direction: column; justify-content: center;">
                 <h1 style="margin: 0; font-size: 1.8rem; font-weight: 100; color: #0F172A; line-height: 1;">
-                    Powered by <span style="font-weight: 400; color: #64748B;">Drag-n-Fly</span>
+                     <span style="font-weight: 400; color: #000000;">Drag-n-Fly</span>
                 </h1>
                 <p style="margin: 4px 0 0; font-size: 0.95rem; color: #64748B; font-weight: 400; max-width: 300px;">
-                    Converting public disclosure PDFs to structured Excel
+                    Powered By Bajaj Life Gen AI Workbench.
                 </p>
             </div>
             ''',
